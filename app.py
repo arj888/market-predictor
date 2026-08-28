@@ -2,7 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 
 st.set_page_config(page_title="Institutional Quant Predictor", layout="centered")
@@ -15,13 +14,21 @@ if st.button("Run Quantitative Analysis"):
         st.error("Please enter a valid ticker.")
     else:
         with st.spinner("Processing statistical engines & mathematical models..."):
-            df = yf.download(ticker, period="3y", interval="1d", auto_adjust=True, progress=False)
+            asset = yf.Ticker(ticker)
+            df = asset.history(period="3y", interval="1d", auto_adjust=False)
 
             if df.empty or len(df) < 100:
                 st.error("Data fetch failed or insufficient trading history.")
             else:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
+
+                try:
+                    current_price = float(asset.fast_info['lastPrice'])
+                    if np.isnan(current_price) or current_price == 0:
+                        current_price = float(df['Close'].iloc[-1])
+                except Exception:
+                    current_price = float(df['Close'].iloc[-1])
 
                 df['Return'] = df['Close'].pct_change()
                 df['Log_Return'] = np.log(df['Close'] / df['Close'].shift(1))
@@ -33,9 +40,9 @@ if st.button("Run Quantitative Analysis"):
                 df['MACD'] = df['EMA_12'] - df['EMA_26']
                 df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-                df['Rolling_Vol_20'] = df['Return'].rolling(20).std()
-                df['BB_Upper'] = df['SMA_20'] + (2 * df['Rolling_Vol_20'] * df['Close'])
-                df['BB_Lower'] = df['SMA_20'] - (2 * df['Rolling_Vol_20'] * df['Close'])
+                df['Rolling_Std_20'] = df['Close'].rolling(20).std()
+                df['BB_Upper'] = df['SMA_20'] + (2 * df['Rolling_Std_20'])
+                df['BB_Lower'] = df['SMA_20'] - (2 * df['Rolling_Std_20'])
                 df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / (df['SMA_20'] + 1e-9)
 
                 delta = df['Close'].diff()
@@ -45,8 +52,8 @@ if st.button("Run Quantitative Analysis"):
                 df['RSI'] = 100 - (100 / (1 + rs))
 
                 high_low = df['High'] - df['Low']
-                high_close = (df['High'] - df['Close'].shift()).abs()
-                low_close = (df['Low'] - df['Close'].shift()).abs()
+                high_close = (df['High'] - df['Close'].shift(1)).abs()
+                low_close = (df['Low'] - df['Close'].shift(1)).abs()
                 tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
                 df['ATR_14'] = tr.rolling(14).mean()
 
@@ -59,7 +66,7 @@ if st.button("Run Quantitative Analysis"):
 
                 features = [
                     'Open', 'High', 'Low', 'Close', 'Volume',
-                    'Return', 'Log_Return', 'Rolling_Vol_20',
+                    'Return', 'Log_Return', 'Rolling_Std_20',
                     'SMA_20', 'SMA_50', 'EMA_12', 'EMA_26',
                     'MACD', 'MACD_Signal', 'BB_Width', 'RSI',
                     'ATR_14', 'Stoch_K', 'Stoch_D'
@@ -82,7 +89,6 @@ if st.button("Run Quantitative Analysis"):
                 pred_log_return_gb = gb_model.predict(latest_features)[0]
 
                 blended_log_return = (0.5 * pred_log_return_rf) + (0.5 * pred_log_return_gb)
-                current_price = clean_df['Close'].iloc[-1]
                 predicted_price = current_price * np.exp(blended_log_return)
                 price_diff = predicted_price - current_price
                 pct_change = (price_diff / current_price) * 100
@@ -125,3 +131,4 @@ if st.button("Run Quantitative Analysis"):
                 r2.metric("Sortino Ratio", f"{sortino_ratio:.2f}")
                 r3.metric("Annual Volatility", f"{volatility * 100:.1f}%")
                 r4.metric("1-Day 95% VaR", f"{var_95:.2f}%")
+
