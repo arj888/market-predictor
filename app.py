@@ -32,11 +32,18 @@ def fetch_macro_series(macro_symbol, target_index):
         macro_df = yf.download(macro_symbol, period="3y", interval="1d", progress=False)
         if macro_df.empty:
             return pd.Series(0.0, index=target_index)
-        if isinstance(macro_df.columns, pd.MultiIndex):
-            close_s = macro_df['Close'].iloc[:, 0]
+        
+        if 'Close' in macro_df:
+            close_data = macro_df['Close']
+            if isinstance(close_data, pd.DataFrame):
+                close_s = close_data.iloc[:, 0]
+            else:
+                close_s = close_data
         else:
-            close_s = macro_df['Close']
-        return close_s.reindex(target_index).ffill().bfill()
+            close_s = macro_df.iloc[:, 0]
+
+        close_s.index = pd.to_datetime(close_s.index)
+        return close_s.reindex(target_index).ffill().bfill().fillna(0.0)
     except Exception:
         return pd.Series(0.0, index=target_index)
 
@@ -53,6 +60,8 @@ if st.button("Run Quantitative Analysis"):
             else:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
+
+                df.index = pd.to_datetime(df.index)
 
                 try:
                     current_price = float(asset.fast_info['lastPrice'])
@@ -102,15 +111,17 @@ if st.button("Run Quantitative Analysis"):
                     'Macro_VIX', 'Macro_TNX', 'Macro_DXY'
                 ]
 
-                clean_df = df.dropna(subset=features)
+                # Data Cleaning & Finite Value Sanitization
+                clean_df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=features)
                 train_data = clean_df.dropna(subset=['Target_Log_Return'])
 
-                X = train_data[features]
-                y = train_data['Target_Log_Return']
+                X = train_data[features].values
+                y = train_data['Target_Log_Return'].values
 
                 scaler = StandardScaler()
                 X_scaled = scaler.fit_transform(X)
-                latest_raw = clean_df[features].iloc[[-1]]
+                
+                latest_raw = clean_df[features].iloc[[-1]].values
                 latest_scaled = scaler.transform(latest_raw)
 
                 nn_model = MLPRegressor(
