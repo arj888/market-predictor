@@ -15,11 +15,11 @@ if st.button("Run Quantitative Analysis"):
     if not ticker:
         st.error("Please enter a valid ticker.")
     else:
-        with st.spinner("Training Deep Neural Network & Quant Engines..."):
+        with st.spinner("Processing statistical engines & mathematical models..."):
             asset = yf.Ticker(ticker)
             df = asset.history(period="3y", interval="1d", auto_adjust=False)
 
-            if df.empty or len(df) < 100:
+            if df.empty or len(df) < 120:
                 st.error("Data fetch failed or insufficient trading history.")
             else:
                 if isinstance(df.columns, pd.MultiIndex):
@@ -33,7 +33,8 @@ if st.button("Run Quantitative Analysis"):
                     current_price = float(df['Close'].iloc[-1])
 
                 df['Return'] = df['Close'].pct_change()
-                df['Log_Return'] = np.log(df['Close'] / df['Close'].shift(1))
+                df['Log_Return'] = np.log(df['Close'] / (df['Close'].shift(1) + 1e-9))
+                
                 df['SMA_20'] = df['Close'].rolling(20).mean()
                 df['SMA_50'] = df['Close'].rolling(50).mean()
                 df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
@@ -47,8 +48,8 @@ if st.button("Run Quantitative Analysis"):
                 df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / (df['SMA_20'] + 1e-9)
 
                 delta = df['Close'].diff()
-                gain = delta.where(delta > 0, 0).rolling(14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                gain = delta.clip(lower=0).rolling(14).mean()
+                loss = (-delta.clip(upper=0)).rolling(14).mean()
                 rs = gain / (loss + 1e-9)
                 df['RSI'] = 100 - (100 / (1 + rs))
 
@@ -58,7 +59,7 @@ if st.button("Run Quantitative Analysis"):
                 tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
                 df['ATR_14'] = tr.rolling(14).mean()
 
-                df['Target_Log_Return'] = df['Log_Return'].shift(-1)
+                df['Target_Log_Return'] = np.log(df['Close'].shift(-1) / (df['Close'] + 1e-9))
 
                 features = [
                     'Open', 'High', 'Low', 'Close', 'Volume',
@@ -75,21 +76,23 @@ if st.button("Run Quantitative Analysis"):
 
                 scaler = StandardScaler()
                 X_scaled = scaler.fit_transform(X)
-                latest_scaled = scaler.transform(clean_df[features].iloc[[-1]])
+                
+                latest_raw = clean_df[features].iloc[[-1]]
+                latest_scaled = scaler.transform(latest_raw)
 
                 nn_model = MLPRegressor(
                     hidden_layer_sizes=(128, 64, 32),
                     activation='relu',
                     solver='adam',
-                    max_iter=300,
+                    max_iter=400,
                     random_state=42
                 )
                 nn_model.fit(X_scaled, y)
-                pred_nn = nn_model.predict(latest_scaled)[0]
+                pred_nn = float(nn_model.predict(latest_scaled)[0])
 
-                rf_model = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
+                rf_model = RandomForestRegressor(n_estimators=120, max_depth=6, random_state=42)
                 rf_model.fit(X, y)
-                pred_rf = rf_model.predict(clean_df[features].iloc[[-1]])[0]
+                pred_rf = float(rf_model.predict(latest_raw)[0])
 
                 blended_log_return = (0.6 * pred_nn) + (0.4 * pred_rf)
                 predicted_price = current_price * np.exp(blended_log_return)
@@ -99,11 +102,12 @@ if st.button("Run Quantitative Analysis"):
                 returns_series = clean_df['Return'].dropna()
                 mean_return = returns_series.mean() * 252
                 volatility = returns_series.std() * np.sqrt(252)
-                sharpe_ratio = (mean_return - 0.05) / (volatility + 1e-9)
+                rf_rate = 0.05
+                sharpe_ratio = (mean_return - rf_rate) / (volatility + 1e-9)
 
                 negative_returns = returns_series[returns_series < 0]
                 downside_std = negative_returns.std() * np.sqrt(252)
-                sortino_ratio = (mean_return - 0.05) / (downside_std + 1e-9)
+                sortino_ratio = (mean_return - rf_rate) / (downside_std + 1e-9)
                 var_95 = (returns_series.mean() - (1.645 * returns_series.std())) * 100
 
                 if pct_change > 0.15:
@@ -129,7 +133,7 @@ if st.button("Run Quantitative Analysis"):
 
                 st.markdown("### Model Breakdown & Risk Metrics")
                 r1, r2, r3, r4 = st.columns(4)
-                r1.metric("Neural Net (Deep ML)", f"{pred_nn * 100:+.2f}%")
+                r1.metric("Neural Net Output", f"{pred_nn * 100:+.2f}%")
                 r2.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
                 r3.metric("Annual Volatility", f"{volatility * 100:.1f}%")
                 r4.metric("1-Day 95% VaR", f"{var_95:.2f}%")
