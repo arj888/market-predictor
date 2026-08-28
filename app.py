@@ -2,60 +2,126 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
+from scipy.stats import norm
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 
-st.set_page_config(page_title="Price Predictor", layout="centered")
-st.title("Market Predictor")
+st.set_page_config(page_title="Institutional Quant Predictor", layout="centered")
+st.title("Market Quant Predictor")
 
-ticker = st.text_input("Enter Ticker (e.g. BTC-USD, RELIANCE.NS, NVDA):", "").strip().upper()
+ticker = st.text_input("Enter Ticker (e.g. BTC-USD, RELIANCE.NS, NVDA, EURUSD=X):", "").strip().upper()
 
-if st.button("Predict"):
+if st.button("Run Quantitative Analysis"):
     if not ticker:
         st.error("Please enter a valid ticker.")
     else:
-        with st.spinner("Calculating..."):
-            df = yf.download(ticker, period="2y", interval="1d", auto_adjust=True, progress=False)
+        with st.spinner("Processing statistical engines & mathematical models..."):
+            df = yf.download(ticker, period="3y", interval="1d", auto_adjust=True, progress=False)
 
-            if df.empty:
-                st.error("Invalid Ticker. Data not found.")
+            if df.empty or len(df) < 100:
+                st.error("Data fetch failed or insufficient trading history.")
             else:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
 
-                df['Daily_Return'] = df['Close'].pct_change()
-                df['Volatility_20'] = df['Daily_Return'].rolling(window=20).std()
-                df['SMA_10'] = df['Close'].rolling(window=10).mean()
-                df['SMA_50'] = df['Close'].rolling(window=50).mean()
+                df['Return'] = df['Close'].pct_change()
+                df['Log_Return'] = np.log(df['Close'] / df['Close'].shift(1))
+
+                df['SMA_20'] = df['Close'].rolling(20).mean()
+                df['SMA_50'] = df['Close'].rolling(50).mean()
+                df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+                df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+                df['MACD'] = df['EMA_12'] - df['EMA_26']
+                df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+                df['Rolling_Vol_20'] = df['Return'].rolling(20).std()
+                df['BB_Upper'] = df['SMA_20'] + (2 * df['Rolling_Vol_20'] * df['Close'])
+                df['BB_Lower'] = df['SMA_20'] - (2 * df['Rolling_Vol_20'] * df['Close'])
+                df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / (df['SMA_20'] + 1e-9)
 
                 delta = df['Close'].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                gain = delta.where(delta > 0, 0).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
                 rs = gain / (loss + 1e-9)
-                df['RSI_14'] = 100 - (100 / (1 + rs))
+                df['RSI'] = 100 - (100 / (1 + rs))
 
-                df['Target'] = df['Close'].shift(-1)
+                high_low = df['High'] - df['Low']
+                high_close = (df['High'] - df['Close'].shift()).abs()
+                low_close = (df['Low'] - df['Close'].shift()).abs()
+                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                df['ATR_14'] = tr.rolling(14).mean()
 
-                features = ['Open', 'High', 'Low', 'Close', 'Volume', 'Daily_Return', 'Volatility_20', 'SMA_10', 'SMA_50', 'RSI_14']
+                low_14 = df['Low'].rolling(14).min()
+                high_14 = df['High'].rolling(14).max()
+                df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14 + 1e-9))
+                df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
+
+                df['Target_Log_Return'] = df['Log_Return'].shift(-1)
+
+                features = [
+                    'Open', 'High', 'Low', 'Close', 'Volume',
+                    'Return', 'Log_Return', 'Rolling_Vol_20',
+                    'SMA_20', 'SMA_50', 'EMA_12', 'EMA_26',
+                    'MACD', 'MACD_Signal', 'BB_Width', 'RSI',
+                    'ATR_14', 'Stoch_K', 'Stoch_D'
+                ]
+
                 clean_df = df.dropna(subset=features)
-                train_df = clean_df.dropna(subset=['Target'])
+                train_data = clean_df.dropna(subset=['Target_Log_Return'])
 
-                model = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
-                model.fit(train_df[features], train_df['Target'])
+                X = train_data[features]
+                y = train_data['Target_Log_Return']
 
+                rf_model = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
+                gb_model = GradientBoostingRegressor(n_estimators=100, max_depth=4, random_state=42)
+
+                rf_model.fit(X, y)
+                gb_model.fit(X, y)
+
+                latest_features = clean_df[features].iloc[[-1]]
+                pred_log_return_rf = rf_model.predict(latest_features)[0]
+                pred_log_return_gb = gb_model.predict(latest_features)[0]
+
+                blended_log_return = (0.5 * pred_log_return_rf) + (0.5 * pred_log_return_gb)
                 current_price = clean_df['Close'].iloc[-1]
-                predicted_price = model.predict(clean_df[features].iloc[[-1]])[0]
-                diff = predicted_price - current_price
-                pct = (diff / current_price) * 100
-                signal = "UP / BUY" if diff > 0 else "DOWN / SELL"
+                predicted_price = current_price * np.exp(blended_log_return)
+                price_diff = predicted_price - current_price
+                pct_change = (price_diff / current_price) * 100
+
+                returns_series = clean_df['Return'].dropna()
+                mean_return = returns_series.mean() * 252
+                volatility = returns_series.std() * np.sqrt(252)
+                sharpe_ratio = (mean_return - 0.05) / (volatility + 1e-9)
+
+                negative_returns = returns_series[returns_series < 0]
+                downside_std = negative_returns.std() * np.sqrt(252)
+                sortino_ratio = (mean_return - 0.05) / (downside_std + 1e-9)
+
+                var_95 = (returns_series.mean() - (1.645 * returns_series.std())) * 100
+
+                if pct_change > 0.15:
+                    signal = "STRONG BUY / BULLISH"
+                elif pct_change < -0.15:
+                    signal = "STRONG SELL / BEARISH"
+                else:
+                    signal = "NEUTRAL / SIDEWAYS"
 
                 st.divider()
-                st.subheader(f"Results for {ticker}")
-                col1, col2 = st.columns(2)
-                col1.metric("Current Price", f"{current_price:.4f}")
-                col2.metric("Predicted Price", f"{predicted_price:.4f}", f"{diff:+.4f} ({pct:+.2f}%)")
-                
-                if diff > 0:
-                    st.success(f"Signal: **{signal}**")
-                else:
-                    st.error(f"Signal: **{signal}**")
+                st.subheader(f"Quant Summary: {ticker}")
 
+                c1, c2 = st.columns(2)
+                c1.metric("Current Market Price", f"{current_price:.4f}")
+                c2.metric("Predicted Next Close", f"{predicted_price:.4f}", f"{price_diff:+.4f} ({pct_change:+.2f}%)")
+
+                if "BUY" in signal:
+                    st.success(f"Signal: **{signal}**")
+                elif "SELL" in signal:
+                    st.error(f"Signal: **{signal}**")
+                else:
+                    st.warning(f"Signal: **{signal}**")
+
+                st.markdown("### Risk & Performance Metrics")
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
+                r2.metric("Sortino Ratio", f"{sortino_ratio:.2f}")
+                r3.metric("Annual Volatility", f"{volatility * 100:.1f}%")
+                r4.metric("1-Day 95% VaR", f"{var_95:.2f}%")
