@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import nltk
+from scipy.stats import skew, kurtosis
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from sklearn.preprocessing import RobustScaler
 from sklearn.neural_network import MLPRegressor
@@ -11,8 +12,8 @@ from sklearn.mixture import GaussianMixture
 
 nltk.download('vader_lexicon', quiet=True)
 
-st.set_page_config(page_title="Institutional Quant Terminal", layout="centered")
-st.title("Sovereign Institutional Quant Engine")
+st.set_page_config(page_title="Frontier Quantitative Terminal", layout="centered")
+st.title("Frontier Sovereign Quant Engine")
 
 ticker = st.text_input("Enter Ticker (e.g. BTC-USD, RELIANCE.NS, NVDA, EURUSD=X):", "").strip().upper()
 
@@ -24,6 +25,35 @@ def compute_hurst_exponent(ts, max_lag=20):
         return float(poly[0])
     except Exception:
         return 0.5
+
+def dominant_fourier_cycle(log_prices):
+    try:
+        n = len(log_prices)
+        detrended = log_prices - np.polyval(np.polyfit(np.arange(n), log_prices, 1), np.arange(n))
+        fft_vals = np.fft.rfft(detrended)
+        fft_power = np.abs(fft_vals)**2
+        freqs = np.fft.rfftfreq(n)
+        if len(fft_power) > 2:
+            peak_idx = np.argmax(fft_power[1:]) + 1
+            if freqs[peak_idx] > 0:
+                dom_period = 1.0 / freqs[peak_idx]
+                return float(min(120, max(5, dom_period)))
+        return 20.0
+    except Exception:
+        return 20.0
+
+def compute_ou_half_life(prices_series):
+    try:
+        p = prices_series.values
+        lag_p = p[:-1]
+        delta_p = np.diff(p)
+        beta = np.polyfit(lag_p, delta_p, 1)[0]
+        if beta < 0:
+            half_life = -np.log(2) / beta
+            return float(min(100.0, max(1.0, half_life)))
+        return 0.0
+    except Exception:
+        return 0.0
 
 def get_sentiment(symbol):
     try:
@@ -61,11 +91,11 @@ def get_benchmark_ticker(symbol):
     else:
         return "^GSPC"
 
-if st.button("Execute Quantitative Synthesis"):
+if st.button("Execute Frontier Synthesis"):
     if not ticker:
         st.error("Please provide a valid market asset identifier.")
     else:
-        with st.spinner("Synthesizing Information Theory, Macro Regimes & Deep Ensembles..."):
+        with st.spinner("Synthesizing Spectral Waves, Stochastic Differential Equations & Deep Ensembles..."):
             asset = yf.Ticker(ticker)
             df = asset.history(period="3y", interval="1d", auto_adjust=False)
 
@@ -101,6 +131,10 @@ if st.button("Execute Quantitative Synthesis"):
                     (2 * np.log(2) - 1) * (np.log(df['Close'] / (df['Open'] + 1e-9)))**2
                 )
                 df['GK_Vol'] = np.sqrt(np.maximum(0, gk_inner))
+                df['Vol_of_Vol'] = df['GK_Vol'].rolling(20).std()
+
+                df['Skew_30'] = df['Return'].rolling(30).skew().fillna(0.0)
+                df['Kurt_30'] = df['Return'].rolling(30).kurt().fillna(0.0)
 
                 df['SMA_20'] = df['Close'].rolling(20).mean()
                 df['SMA_50'] = df['Close'].rolling(50).mean()
@@ -132,16 +166,17 @@ if st.button("Execute Quantitative Synthesis"):
                 df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14 + 1e-9))
                 df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
 
-                regime_features = df[['Return', 'GK_Vol', 'Rolling_Std_20']].dropna()
+                regime_features = df[['Return', 'GK_Vol', 'Rolling_Std_20', 'Vol_of_Vol']].dropna()
                 gmm = GaussianMixture(n_components=3, random_state=42)
                 regimes = gmm.fit_predict(regime_features)
                 df['Regime'] = pd.Series(regimes, index=regime_features.index).reindex(df.index).ffill().bfill().fillna(0)
 
                 current_regime_id = int(df['Regime'].iloc[-1])
-                regime_map = {0: "Low-Vol Expansion (Bullish)", 1: "High-Vol Tail Risk (Shock)", 2: "Mean-Reverting (Distribution)"}
+                regime_map = {0: "Low-Vol Expansion (Bullish)", 1: "High-Vol Tail Shock (Risk)", 2: "Mean-Reverting Equilibrium"}
                 regime_label = regime_map.get(current_regime_id, "Trending Flow")
 
-                hurst_val = compute_hurst_exponent(df['Close'].values[-120:])
+                recent_closes = df['Close'].values[-120:]
+                hurst_val = compute_hurst_exponent(recent_closes)
                 if hurst_val > 0.55:
                     fractal_state = "Persistent Trend"
                 elif hurst_val < 0.45:
@@ -149,12 +184,15 @@ if st.button("Execute Quantitative Synthesis"):
                 else:
                     fractal_state = "Brownian Motion"
 
+                fft_dominant_days = dominant_fourier_cycle(np.log(recent_closes))
+                ou_half_life_days = compute_ou_half_life(df['Close'].iloc[-120:])
+
                 df['Target_Log_Return'] = np.log(df['Close'].shift(-1) / (df['Close'] + 1e-9))
 
                 features = [
                     'Open', 'High', 'Low', 'Close', 'Volume',
-                    'Return', 'Log_Return', 'GK_Vol', 'Rolling_Std_20',
-                    'SMA_20', 'SMA_50', 'SMA_200', 'MACD', 'MACD_Signal',
+                    'Return', 'Log_Return', 'GK_Vol', 'Vol_of_Vol', 'Rolling_Std_20',
+                    'Skew_30', 'Kurt_30', 'SMA_20', 'SMA_50', 'SMA_200', 'MACD', 'MACD_Signal',
                     'BB_Width', 'RSI', 'ATR_14', 'Stoch_K', 'Stoch_D',
                     'Macro_VIX', 'Macro_TNX', 'Macro_DXY', 'Macro_GOLD', 'Regime'
                 ]
@@ -220,6 +258,10 @@ if st.button("Execute Quantitative Synthesis"):
                 pct_change = (price_diff / current_price) * 100
 
                 current_atr = float(clean_df['ATR_14'].iloc[-1])
+                pred_std = float(clean_df['Return'].std())
+                lower_band = current_price * np.exp(final_log_return - (1.96 * pred_std))
+                upper_band = current_price * np.exp(final_log_return + (1.96 * pred_std))
+
                 if pct_change > 0.15:
                     signal = "STRONG BUY / LONG EXPANSION"
                     target_1 = current_price + (2.0 * current_atr)
@@ -257,7 +299,7 @@ if st.button("Execute Quantitative Synthesis"):
                 sortino_ratio = (mean_return - rf_rate) / (downside_std + 1e-9)
 
                 st.divider()
-                st.subheader(f"Quantitative Synthesis: {ticker}")
+                st.subheader(f"Frontier Quant Terminal: {ticker}")
 
                 c1, c2 = st.columns(2)
                 c1.metric("Live Market Price", f"{current_price:.4f}")
@@ -270,16 +312,23 @@ if st.button("Execute Quantitative Synthesis"):
                 else:
                     st.warning(f"Signal: **{signal}**")
 
-                st.markdown("### Execution Plan & Capital Allocation")
+                st.markdown("### Execution Strategy & Bayesian Expected Band")
                 t1, t2, t3, t4 = st.columns(4)
                 t1.metric("Take-Profit (2.0x ATR)", f"{target_1:.4f}")
                 t2.metric("Stop-Loss (1.0x ATR)", f"{stop_loss:.4f}")
-                t3.metric("Walk-Forward Accuracy", f"{win_rate:.1f}%")
+                t3.metric("95% Expected Range", f"{lower_band:.2f} - {upper_band:.2f}")
                 t4.metric("Kelly Allocation", f"{safe_kelly:.1f}%")
 
-                st.markdown("### Mathematical Regimes & Risk Diagnostics")
+                st.markdown("### Frontier Spectral & Non-Linear Diagnostics")
+                f1, f2, f3, f4 = st.columns(4)
+                f1.metric("Dominant Cycle (FFT)", f"{fft_dominant_days:.1f} Days")
+                f2.metric("OU Half-Life", f"{ou_half_life_days:.1f} Days" if ou_half_life_days > 0 else "Pure Trend")
+                f3.metric("Fractal Hurst (H)", f"{hurst_val:.2f} ({fractal_state})")
+                f4.metric("Walk-Forward Accuracy", f"{win_rate:.1f}%")
+
+                st.markdown("### Institutional Macro & Tail Risk Regimes")
                 r1, r2, r3, r4 = st.columns(4)
                 r1.metric("Market Regime (GMM)", regime_label.split()[0])
-                r2.metric("Fractal Hurst (H)", f"{hurst_val:.2f} ({fractal_state})")
-                r3.metric(f"Beta ({benchmark_sym})", f"{beta_val:.2f}")
-                r4.metric("Sharpe / Sortino", f"{sharpe_ratio:.2f} / {sortino_ratio:.2f}")
+                r2.metric(f"Beta ({benchmark_sym})", f"{beta_val:.2f}")
+                r3.metric("Sharpe / Sortino", f"{sharpe_ratio:.2f} / {sortino_ratio:.2f}")
+                r4.metric("Skew / Kurtosis", f"{clean_df['Skew_30'].iloc[-1]:.2f} / {clean_df['Kurt_30'].iloc[-1]:.2f}")
