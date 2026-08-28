@@ -1,4 +1,4 @@
-herestreamlit
+streamlit
 yfinance
 scikit-learn
 pandas
