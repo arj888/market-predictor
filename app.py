@@ -2,20 +2,49 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from sklearn.preprocessing import StandardScaler
 from sklearn.neural_network import MLPRegressor
 from sklearn.ensemble import RandomForestRegressor
 
-st.set_page_config(page_title="Neural Quant Predictor", layout="centered")
-st.title("Neural Quant Predictor (DL + ML)")
+nltk.download('vader_lexicon', quiet=True)
+
+st.set_page_config(page_title="Macro-Sentiment Quant Predictor", layout="centered")
+st.title("Neural Quant Predictor (Macro + Sentiment + DL)")
 
 ticker = st.text_input("Enter Ticker (e.g. BTC-USD, RELIANCE.NS, NVDA, EURUSD=X):", "").strip().upper()
+
+def get_sentiment(symbol):
+    try:
+        t = yf.Ticker(symbol)
+        news = t.news
+        if not news:
+            return 0.0
+        sia = SentimentIntensityAnalyzer()
+        scores = [sia.polarity_scores(item.get('title', ''))['compound'] for item in news]
+        return float(np.mean(scores)) if scores else 0.0
+    except Exception:
+        return 0.0
+
+def fetch_macro_series(macro_symbol, target_index):
+    try:
+        macro_df = yf.download(macro_symbol, period="3y", interval="1d", progress=False)
+        if macro_df.empty:
+            return pd.Series(0.0, index=target_index)
+        if isinstance(macro_df.columns, pd.MultiIndex):
+            close_s = macro_df['Close'].iloc[:, 0]
+        else:
+            close_s = macro_df['Close']
+        return close_s.reindex(target_index).ffill().bfill()
+    except Exception:
+        return pd.Series(0.0, index=target_index)
 
 if st.button("Run Quantitative Analysis"):
     if not ticker:
         st.error("Please enter a valid ticker.")
     else:
-        with st.spinner("Processing statistical engines & mathematical models..."):
+        with st.spinner("Processing Macro regimes, News sentiment & Deep ML engines..."):
             asset = yf.Ticker(ticker)
             df = asset.history(period="3y", interval="1d", auto_adjust=False)
 
@@ -27,10 +56,14 @@ if st.button("Run Quantitative Analysis"):
 
                 try:
                     current_price = float(asset.fast_info['lastPrice'])
-                    if np.isnan(current_price) or current_price == 0:
+                    if np.isnan(current_price) or current_price <= 0:
                         current_price = float(df['Close'].iloc[-1])
                 except Exception:
                     current_price = float(df['Close'].iloc[-1])
+
+                df['Macro_VIX'] = fetch_macro_series("^VIX", df.index)
+                df['Macro_TNX'] = fetch_macro_series("^TNX", df.index)
+                df['Macro_DXY'] = fetch_macro_series("DX-Y.NYB", df.index)
 
                 df['Return'] = df['Close'].pct_change()
                 df['Log_Return'] = np.log(df['Close'] / (df['Close'].shift(1) + 1e-9))
@@ -65,7 +98,8 @@ if st.button("Run Quantitative Analysis"):
                     'Open', 'High', 'Low', 'Close', 'Volume',
                     'Return', 'Log_Return', 'Rolling_Std_20',
                     'SMA_20', 'SMA_50', 'MACD', 'MACD_Signal',
-                    'BB_Width', 'RSI', 'ATR_14'
+                    'BB_Width', 'RSI', 'ATR_14',
+                    'Macro_VIX', 'Macro_TNX', 'Macro_DXY'
                 ]
 
                 clean_df = df.dropna(subset=features)
@@ -76,7 +110,6 @@ if st.button("Run Quantitative Analysis"):
 
                 scaler = StandardScaler()
                 X_scaled = scaler.fit_transform(X)
-                
                 latest_raw = clean_df[features].iloc[[-1]]
                 latest_scaled = scaler.transform(latest_raw)
 
@@ -95,7 +128,12 @@ if st.button("Run Quantitative Analysis"):
                 pred_rf = float(rf_model.predict(latest_raw)[0])
 
                 blended_log_return = (0.6 * pred_nn) + (0.4 * pred_rf)
-                predicted_price = current_price * np.exp(blended_log_return)
+
+                live_sentiment = get_sentiment(ticker)
+                sentiment_shock = live_sentiment * 0.003
+                final_log_return = blended_log_return + sentiment_shock
+
+                predicted_price = current_price * np.exp(final_log_return)
                 price_diff = predicted_price - current_price
                 pct_change = (price_diff / current_price) * 100
 
@@ -131,9 +169,9 @@ if st.button("Run Quantitative Analysis"):
                 else:
                     st.warning(f"Signal: **{signal}**")
 
-                st.markdown("### Model Breakdown & Risk Metrics")
+                st.markdown("### Model Breakdown & External Factors")
                 r1, r2, r3, r4 = st.columns(4)
-                r1.metric("Neural Net Output", f"{pred_nn * 100:+.2f}%")
-                r2.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
-                r3.metric("Annual Volatility", f"{volatility * 100:.1f}%")
+                r1.metric("News Sentiment", f"{live_sentiment:+.2f}")
+                r2.metric("Macro VIX (Fear)", f"{clean_df['Macro_VIX'].iloc[-1]:.2f}")
+                r3.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
                 r4.metric("1-Day 95% VaR", f"{var_95:.2f}%")
