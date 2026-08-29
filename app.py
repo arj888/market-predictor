@@ -12,8 +12,8 @@ from sklearn.mixture import GaussianMixture
 
 nltk.download('vader_lexicon', quiet=True)
 
-st.set_page_config(page_title="Frontier Quantitative Terminal", layout="centered")
-st.title("Frontier Sovereign Quant Engine")
+st.set_page_config(page_title="Frontier Quantitative Terminal", layout="wide")
+st.title("Frontier Sovereign Quant Terminal & Multi-Asset Scanner")
 
 ASSET_PRESETS = {
     "Crypto": {
@@ -51,28 +51,8 @@ ASSET_PRESETS = {
         "Gold (GC=F)": "GC=F",
         "Silver (SI=F)": "SI=F",
         "Crude Oil (CL=F)": "CL=F"
-    },
-    "Custom Ticker": {}
+    }
 }
-
-c_cat, c_asset = st.columns(2)
-
-with c_cat:
-    selected_category = st.selectbox(
-        "Choose Market Category:",
-        list(ASSET_PRESETS.keys())
-    )
-
-with c_asset:
-    if selected_category != "Custom Ticker":
-        asset_options = ASSET_PRESETS[selected_category]
-        selected_asset_label = st.selectbox(
-            f"Select {selected_category} Asset:",
-            list(asset_options.keys())
-        )
-        ticker = asset_options[selected_asset_label]
-    else:
-        ticker = st.text_input("Enter Any Custom Ticker (e.g. BTC-USD, RELIANCE.NS, TSLA):", "").strip().upper()
 
 def compute_hurst_exponent(ts, max_lag=20):
     try:
@@ -148,244 +128,332 @@ def get_benchmark_ticker(symbol):
     else:
         return "^GSPC"
 
-if st.button("Execute Frontier Synthesis"):
-    if not ticker:
-        st.error("Please select or enter a valid market asset identifier.")
-    else:
-        with st.spinner(f"Synthesizing Spectral Waves, Stochastic Differential Equations & Deep Ensembles for {ticker}..."):
-            asset = yf.Ticker(ticker)
-            df = asset.history(period="3y", interval="1d", auto_adjust=False)
+def analyze_single_asset(sym):
+    try:
+        asset = yf.Ticker(sym)
+        df = asset.history(period="3y", interval="1d", auto_adjust=False)
+        if df.empty or len(df) < 140:
+            return None
 
-            if df.empty or len(df) < 140:
-                st.error("Data fetch failed or insufficient historical liquidity depth.")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+
+        try:
+            current_price = float(asset.fast_info['lastPrice'])
+            if np.isnan(current_price) or current_price <= 0:
+                current_price = float(df['Close'].iloc[-1])
+        except Exception:
+            current_price = float(df['Close'].iloc[-1])
+
+        df['Macro_VIX'] = fetch_macro_series("^VIX", df.index)
+        df['Macro_TNX'] = fetch_macro_series("^TNX", df.index)
+        df['Macro_DXY'] = fetch_macro_series("DX-Y.NYB", df.index)
+        df['Macro_GOLD'] = fetch_macro_series("GC=F", df.index)
+
+        benchmark_sym = get_benchmark_ticker(sym)
+        bench_series = fetch_macro_series(benchmark_sym, df.index)
+        bench_returns = bench_series.pct_change()
+
+        df['Return'] = df['Close'].pct_change()
+        df['Log_Return'] = np.log(df['Close'] / (df['Close'].shift(1) + 1e-9))
+
+        gk_inner = (
+            0.5 * (np.log(df['High'] / (df['Low'] + 1e-9)))**2 - 
+            (2 * np.log(2) - 1) * (np.log(df['Close'] / (df['Open'] + 1e-9)))**2
+        )
+        df['GK_Vol'] = np.sqrt(np.maximum(0, gk_inner))
+        df['Vol_of_Vol'] = df['GK_Vol'].rolling(20).std()
+
+        df['Skew_30'] = df['Return'].rolling(30).skew().fillna(0.0)
+        df['Kurt_30'] = df['Return'].rolling(30).kurt().fillna(0.0)
+
+        df['SMA_20'] = df['Close'].rolling(20).mean()
+        df['SMA_50'] = df['Close'].rolling(50).mean()
+        df['SMA_200'] = df['Close'].rolling(200).mean().fillna(df['SMA_50'])
+        df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+        df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = df['EMA_12'] - df['EMA_26']
+        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+        df['Rolling_Std_20'] = df['Close'].rolling(20).std()
+        df['BB_Upper'] = df['SMA_20'] + (2 * df['Rolling_Std_20'])
+        df['BB_Lower'] = df['SMA_20'] - (2 * df['Rolling_Std_20'])
+        df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / (df['SMA_20'] + 1e-9)
+
+        delta = df['Close'].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / (loss + 1e-9)
+        df['RSI'] = 100 - (100 / (1 + rs))
+
+        high_low = df['High'] - df['Low']
+        high_close = (df['High'] - df['Close'].shift(1)).abs()
+        low_close = (df['Low'] - df['Close'].shift(1)).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['ATR_14'] = tr.rolling(14).mean()
+
+        low_14 = df['Low'].rolling(14).min()
+        high_14 = df['High'].rolling(14).max()
+        df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14 + 1e-9))
+        df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
+
+        regime_features = df[['Return', 'GK_Vol', 'Rolling_Std_20', 'Vol_of_Vol']].dropna()
+        gmm = GaussianMixture(n_components=3, random_state=42)
+        regimes = gmm.fit_predict(regime_features)
+        df['Regime'] = pd.Series(regimes, index=regime_features.index).reindex(df.index).ffill().bfill().fillna(0)
+
+        current_regime_id = int(df['Regime'].iloc[-1])
+        regime_map = {0: "Low-Vol Expansion", 1: "High-Vol Tail Shock", 2: "Mean-Reversion"}
+        regime_label = regime_map.get(current_regime_id, "Trending Flow")
+
+        recent_closes = df['Close'].values[-120:]
+        hurst_val = compute_hurst_exponent(recent_closes)
+        if hurst_val > 0.55:
+            fractal_state = "Persistent Trend"
+        elif hurst_val < 0.45:
+            fractal_state = "Mean-Reverting"
+        else:
+            fractal_state = "Brownian Motion"
+
+        fft_dominant_days = dominant_fourier_cycle(np.log(recent_closes))
+        ou_half_life_days = compute_ou_half_life(df['Close'].iloc[-120:])
+
+        df['Target_Log_Return'] = np.log(df['Close'].shift(-1) / (df['Close'] + 1e-9))
+
+        features = [
+            'Open', 'High', 'Low', 'Close', 'Volume',
+            'Return', 'Log_Return', 'GK_Vol', 'Vol_of_Vol', 'Rolling_Std_20',
+            'Skew_30', 'Kurt_30', 'SMA_20', 'SMA_50', 'SMA_200', 'MACD', 'MACD_Signal',
+            'BB_Width', 'RSI', 'ATR_14', 'Stoch_K', 'Stoch_D',
+            'Macro_VIX', 'Macro_TNX', 'Macro_DXY', 'Macro_GOLD', 'Regime'
+        ]
+
+        clean_df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=features)
+        train_data = clean_df.dropna(subset=['Target_Log_Return'])
+
+        X = train_data[features].values
+        y = train_data['Target_Log_Return'].values
+
+        test_sample = min(120, len(X) - 30)
+        if test_sample > 20:
+            X_train_bt, X_test_bt = X[:-test_sample], X[-test_sample:]
+            y_train_bt, y_test_bt = y[:-test_sample], y[-test_sample:]
+            
+            scaler_bt = RobustScaler()
+            X_train_bt_scaled = scaler_bt.fit_transform(X_train_bt)
+            X_test_bt_scaled = scaler_bt.transform(X_test_bt)
+            
+            nn_bt = MLPRegressor(hidden_layer_sizes=(128, 64, 32), activation='relu', solver='adam', max_iter=300, random_state=42)
+            rf_bt = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
+            gb_bt = GradientBoostingRegressor(n_estimators=80, max_depth=4, random_state=42)
+            
+            nn_bt.fit(X_train_bt_scaled, y_train_bt)
+            rf_bt.fit(X_train_bt, y_train_bt)
+            gb_bt.fit(X_train_bt, y_train_bt)
+            
+            p_nn_bt = nn_bt.predict(X_test_bt_scaled)
+            p_rf_bt = rf_bt.predict(X_test_bt)
+            p_gb_bt = gb_bt.predict(X_test_bt)
+            blend_bt = (0.50 * p_nn_bt) + (0.25 * p_rf_bt) + (0.25 * p_gb_bt)
+            
+            correct_hits = np.sum((blend_bt > 0) == (y_test_bt > 0))
+            win_rate = (correct_hits / test_sample) * 100.0
+        else:
+            win_rate = 52.0
+
+        scaler = RobustScaler()
+        X_scaled = scaler.fit_transform(X)
+        latest_raw = clean_df[features].iloc[[-1]].values
+        latest_scaled = scaler.transform(latest_raw)
+
+        nn_model = MLPRegressor(hidden_layer_sizes=(128, 64, 32), activation='relu', solver='adam', max_iter=450, random_state=42)
+        nn_model.fit(X_scaled, y)
+        pred_nn = float(nn_model.predict(latest_scaled)[0])
+
+        rf_model = RandomForestRegressor(n_estimators=120, max_depth=6, random_state=42)
+        rf_model.fit(X, y)
+        pred_rf = float(rf_model.predict(latest_raw)[0])
+
+        gb_model = GradientBoostingRegressor(n_estimators=100, max_depth=4, random_state=42)
+        gb_model.fit(X, y)
+        pred_gb = float(gb_model.predict(latest_raw)[0])
+
+        blended_log_return = (0.50 * pred_nn) + (0.25 * pred_rf) + (0.25 * pred_gb)
+
+        live_sentiment = get_sentiment(sym)
+        sentiment_shock = live_sentiment * 0.003
+        final_log_return = blended_log_return + sentiment_shock
+
+        predicted_price = current_price * np.exp(final_log_return)
+        price_diff = predicted_price - current_price
+        pct_change = (price_diff / current_price) * 100
+
+        current_atr = float(clean_df['ATR_14'].iloc[-1])
+        pred_std = float(clean_df['Return'].std())
+        lower_band = current_price * np.exp(final_log_return - (1.96 * pred_std))
+        upper_band = current_price * np.exp(final_log_return + (1.96 * pred_std))
+
+        if pct_change > 0.15:
+            signal = "STRONG BUY"
+            target_1 = current_price + (2.0 * current_atr)
+            stop_loss = current_price - (1.0 * current_atr)
+        elif pct_change < -0.15:
+            signal = "STRONG SELL"
+            target_1 = current_price - (2.0 * current_atr)
+            stop_loss = current_price + (1.0 * current_atr)
+        else:
+            signal = "NEUTRAL"
+            target_1 = current_price + current_atr
+            stop_loss = current_price - current_atr
+
+        p_win = max(0.35, min(0.75, win_rate / 100.0))
+        b_odds = 2.0
+        q_loss = 1.0 - p_win
+        kelly_fraction = max(0.0, (b_odds * p_win - q_loss) / b_odds) * 100.0
+        safe_kelly = kelly_fraction * 0.5
+
+        aligned_returns = pd.concat([clean_df['Return'], bench_returns], axis=1).dropna()
+        if len(aligned_returns) > 30 and aligned_returns.iloc[:, 1].var() > 0:
+            cov_matrix = np.cov(aligned_returns.iloc[:, 0], aligned_returns.iloc[:, 1])
+            beta_val = cov_matrix[0, 1] / cov_matrix[1, 1]
+        else:
+            beta_val = 1.0
+
+        returns_series = clean_df['Return'].dropna()
+        mean_return = returns_series.mean() * 252
+        volatility = returns_series.std() * np.sqrt(252)
+        rf_rate = 0.05
+        sharpe_ratio = (mean_return - rf_rate) / (volatility + 1e-9)
+
+        negative_returns = returns_series[returns_series < 0]
+        downside_std = negative_returns.std() * np.sqrt(252)
+        sortino_ratio = (mean_return - rf_rate) / (downside_std + 1e-9)
+
+        return {
+            'ticker': sym,
+            'current_price': current_price,
+            'predicted_price': predicted_price,
+            'price_diff': price_diff,
+            'pct_change': pct_change,
+            'signal': signal,
+            'target': target_1,
+            'stop_loss': stop_loss,
+            'win_rate': win_rate,
+            'safe_kelly': safe_kelly,
+            'lower_band': lower_band,
+            'upper_band': upper_band,
+            'fft_days': fft_dominant_days,
+            'ou_days': ou_half_life_days,
+            'hurst': hurst_val,
+            'fractal_state': fractal_state,
+            'regime': regime_label,
+            'beta': beta_val,
+            'benchmark': benchmark_sym,
+            'sharpe': sharpe_ratio,
+            'sortino': sortino_ratio,
+            'skew': clean_df['Skew_30'].iloc[-1],
+            'kurt': clean_df['Kurt_30'].iloc[-1]
+        }
+    except Exception:
+        return None
+
+app_mode = st.radio("Select Interface Mode:", ["Scan All Listed Assets (Leaderboard Matrix)", "Single Asset Deep Diagnostic"], horizontal=True)
+
+if app_mode == "Scan All Listed Assets (Leaderboard Matrix)":
+    selected_category = st.selectbox("Choose Category to Scan All Assets:", list(ASSET_PRESETS.keys()))
+    
+    if st.button(f"Scan All {selected_category} Assets Simultaneously"):
+        assets_to_scan = ASSET_PRESETS[selected_category]
+        results = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        items = list(assets_to_scan.items())
+        total = len(items)
+        
+        for idx, (label, sym) in enumerate(items):
+            status_text.text(f"Computing Deep ML & Physics Ensembles for {label} ({idx+1}/{total})...")
+            res = analyze_single_asset(sym)
+            if res:
+                res['Asset Name'] = label
+                results.append(res)
+            progress_bar.progress((idx + 1) / total)
+            
+        status_text.empty()
+        progress_bar.empty()
+        
+        if results:
+            st.subheader(f"📊 Quantitative Intelligence Matrix: {selected_category}")
+            
+            table_data = []
+            for r in results:
+                table_data.append({
+                    "Asset": r['Asset Name'],
+                    "Live Price": f"{r['current_price']:.4f}",
+                    "Predicted Close": f"{r['predicted_price']:.4f}",
+                    "Expected Return": f"{r['pct_change']:+.2f}%",
+                    "Quant Signal": r['signal'],
+                    "Target (2x ATR)": f"{r['target']:.4f}",
+                    "Stop-Loss (1x ATR)": f"{r['stop_loss']:.4f}",
+                    "Backtest Hit%": f"{r['win_rate']:.1f}%",
+                    "Kelly Sizing": f"{r['safe_kelly']:.1f}%",
+                    "Regime": r['regime'],
+                    "Hurst (H)": f"{r['hurst']:.2f}"
+                })
+            
+            df_table = pd.DataFrame(table_data)
+            st.dataframe(df_table, use_container_width=True)
+        else:
+            st.error("Failed to extract data for listed assets.")
+
+else:
+    c_cat, c_asset = st.columns(2)
+    with c_cat:
+        selected_category = st.selectbox("Category:", list(ASSET_PRESETS.keys()))
+    with c_asset:
+        asset_options = ASSET_PRESETS[selected_category]
+        selected_asset_label = st.selectbox(f"Select Asset:", list(asset_options.keys()))
+        ticker = asset_options[selected_asset_label]
+
+    if st.button(f"Execute Deep Diagnostic for {selected_asset_label}"):
+        with st.spinner(f"Processing Full Mathematical Matrix for {ticker}..."):
+            r = analyze_single_asset(ticker)
+            if not r:
+                st.error("Diagnostic execution failed.")
             else:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-
-                df.index = pd.to_datetime(df.index).tz_localize(None)
-
-                try:
-                    current_price = float(asset.fast_info['lastPrice'])
-                    if np.isnan(current_price) or current_price <= 0:
-                        current_price = float(df['Close'].iloc[-1])
-                except Exception:
-                    current_price = float(df['Close'].iloc[-1])
-
-                df['Macro_VIX'] = fetch_macro_series("^VIX", df.index)
-                df['Macro_TNX'] = fetch_macro_series("^TNX", df.index)
-                df['Macro_DXY'] = fetch_macro_series("DX-Y.NYB", df.index)
-                df['Macro_GOLD'] = fetch_macro_series("GC=F", df.index)
-
-                benchmark_sym = get_benchmark_ticker(ticker)
-                bench_series = fetch_macro_series(benchmark_sym, df.index)
-                bench_returns = bench_series.pct_change()
-
-                df['Return'] = df['Close'].pct_change()
-                df['Log_Return'] = np.log(df['Close'] / (df['Close'].shift(1) + 1e-9))
-
-                gk_inner = (
-                    0.5 * (np.log(df['High'] / (df['Low'] + 1e-9)))**2 - 
-                    (2 * np.log(2) - 1) * (np.log(df['Close'] / (df['Open'] + 1e-9)))**2
-                )
-                df['GK_Vol'] = np.sqrt(np.maximum(0, gk_inner))
-                df['Vol_of_Vol'] = df['GK_Vol'].rolling(20).std()
-
-                df['Skew_30'] = df['Return'].rolling(30).skew().fillna(0.0)
-                df['Kurt_30'] = df['Return'].rolling(30).kurt().fillna(0.0)
-
-                df['SMA_20'] = df['Close'].rolling(20).mean()
-                df['SMA_50'] = df['Close'].rolling(50).mean()
-                df['SMA_200'] = df['Close'].rolling(200).mean().fillna(df['SMA_50'])
-                df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
-                df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
-                df['MACD'] = df['EMA_12'] - df['EMA_26']
-                df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-                df['Rolling_Std_20'] = df['Close'].rolling(20).std()
-                df['BB_Upper'] = df['SMA_20'] + (2 * df['Rolling_Std_20'])
-                df['BB_Lower'] = df['SMA_20'] - (2 * df['Rolling_Std_20'])
-                df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / (df['SMA_20'] + 1e-9)
-
-                delta = df['Close'].diff()
-                gain = delta.clip(lower=0).rolling(14).mean()
-                loss = (-delta.clip(upper=0)).rolling(14).mean()
-                rs = gain / (loss + 1e-9)
-                df['RSI'] = 100 - (100 / (1 + rs))
-
-                high_low = df['High'] - df['Low']
-                high_close = (df['High'] - df['Close'].shift(1)).abs()
-                low_close = (df['Low'] - df['Close'].shift(1)).abs()
-                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-                df['ATR_14'] = tr.rolling(14).mean()
-
-                low_14 = df['Low'].rolling(14).min()
-                high_14 = df['High'].rolling(14).max()
-                df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14 + 1e-9))
-                df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
-
-                regime_features = df[['Return', 'GK_Vol', 'Rolling_Std_20', 'Vol_of_Vol']].dropna()
-                gmm = GaussianMixture(n_components=3, random_state=42)
-                regimes = gmm.fit_predict(regime_features)
-                df['Regime'] = pd.Series(regimes, index=regime_features.index).reindex(df.index).ffill().bfill().fillna(0)
-
-                current_regime_id = int(df['Regime'].iloc[-1])
-                regime_map = {0: "Low-Vol Expansion (Bullish)", 1: "High-Vol Tail Shock (Risk)", 2: "Mean-Reverting Equilibrium"}
-                regime_label = regime_map.get(current_regime_id, "Trending Flow")
-
-                recent_closes = df['Close'].values[-120:]
-                hurst_val = compute_hurst_exponent(recent_closes)
-                if hurst_val > 0.55:
-                    fractal_state = "Persistent Trend"
-                elif hurst_val < 0.45:
-                    fractal_state = "Mean-Reverting"
-                else:
-                    fractal_state = "Brownian Motion"
-
-                fft_dominant_days = dominant_fourier_cycle(np.log(recent_closes))
-                ou_half_life_days = compute_ou_half_life(df['Close'].iloc[-120:])
-
-                df['Target_Log_Return'] = np.log(df['Close'].shift(-1) / (df['Close'] + 1e-9))
-
-                features = [
-                    'Open', 'High', 'Low', 'Close', 'Volume',
-                    'Return', 'Log_Return', 'GK_Vol', 'Vol_of_Vol', 'Rolling_Std_20',
-                    'Skew_30', 'Kurt_30', 'SMA_20', 'SMA_50', 'SMA_200', 'MACD', 'MACD_Signal',
-                    'BB_Width', 'RSI', 'ATR_14', 'Stoch_K', 'Stoch_D',
-                    'Macro_VIX', 'Macro_TNX', 'Macro_DXY', 'Macro_GOLD', 'Regime'
-                ]
-
-                clean_df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=features)
-                train_data = clean_df.dropna(subset=['Target_Log_Return'])
-
-                X = train_data[features].values
-                y = train_data['Target_Log_Return'].values
-
-                test_sample = min(120, len(X) - 30)
-                if test_sample > 20:
-                    X_train_bt, X_test_bt = X[:-test_sample], X[-test_sample:]
-                    y_train_bt, y_test_bt = y[:-test_sample], y[-test_sample:]
-                    
-                    scaler_bt = RobustScaler()
-                    X_train_bt_scaled = scaler_bt.fit_transform(X_train_bt)
-                    X_test_bt_scaled = scaler_bt.transform(X_test_bt)
-                    
-                    nn_bt = MLPRegressor(hidden_layer_sizes=(128, 64, 32), activation='relu', solver='adam', max_iter=300, random_state=42)
-                    rf_bt = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
-                    gb_bt = GradientBoostingRegressor(n_estimators=80, max_depth=4, random_state=42)
-                    
-                    nn_bt.fit(X_train_bt_scaled, y_train_bt)
-                    rf_bt.fit(X_train_bt, y_train_bt)
-                    gb_bt.fit(X_train_bt, y_train_bt)
-                    
-                    p_nn_bt = nn_bt.predict(X_test_bt_scaled)
-                    p_rf_bt = rf_bt.predict(X_test_bt)
-                    p_gb_bt = gb_bt.predict(X_test_bt)
-                    blend_bt = (0.50 * p_nn_bt) + (0.25 * p_rf_bt) + (0.25 * p_gb_bt)
-                    
-                    correct_hits = np.sum((blend_bt > 0) == (y_test_bt > 0))
-                    win_rate = (correct_hits / test_sample) * 100.0
-                else:
-                    win_rate = 52.0
-
-                scaler = RobustScaler()
-                X_scaled = scaler.fit_transform(X)
-                latest_raw = clean_df[features].iloc[[-1]].values
-                latest_scaled = scaler.transform(latest_raw)
-
-                nn_model = MLPRegressor(hidden_layer_sizes=(128, 64, 32), activation='relu', solver='adam', max_iter=450, random_state=42)
-                nn_model.fit(X_scaled, y)
-                pred_nn = float(nn_model.predict(latest_scaled)[0])
-
-                rf_model = RandomForestRegressor(n_estimators=120, max_depth=6, random_state=42)
-                rf_model.fit(X, y)
-                pred_rf = float(rf_model.predict(latest_raw)[0])
-
-                gb_model = GradientBoostingRegressor(n_estimators=100, max_depth=4, random_state=42)
-                gb_model.fit(X, y)
-                pred_gb = float(gb_model.predict(latest_raw)[0])
-
-                blended_log_return = (0.50 * pred_nn) + (0.25 * pred_rf) + (0.25 * pred_gb)
-
-                live_sentiment = get_sentiment(ticker)
-                sentiment_shock = live_sentiment * 0.003
-                final_log_return = blended_log_return + sentiment_shock
-
-                predicted_price = current_price * np.exp(final_log_return)
-                price_diff = predicted_price - current_price
-                pct_change = (price_diff / current_price) * 100
-
-                current_atr = float(clean_df['ATR_14'].iloc[-1])
-                pred_std = float(clean_df['Return'].std())
-                lower_band = current_price * np.exp(final_log_return - (1.96 * pred_std))
-                upper_band = current_price * np.exp(final_log_return + (1.96 * pred_std))
-
-                if pct_change > 0.15:
-                    signal = "STRONG BUY / LONG EXPANSION"
-                    target_1 = current_price + (2.0 * current_atr)
-                    stop_loss = current_price - (1.0 * current_atr)
-                elif pct_change < -0.15:
-                    signal = "STRONG SELL / SHORT CONTRACTION"
-                    target_1 = current_price - (2.0 * current_atr)
-                    stop_loss = current_price + (1.0 * current_atr)
-                else:
-                    signal = "NEUTRAL / MARKET EQUILIBRIUM"
-                    target_1 = current_price + current_atr
-                    stop_loss = current_price - current_atr
-
-                p_win = max(0.35, min(0.75, win_rate / 100.0))
-                b_odds = 2.0
-                q_loss = 1.0 - p_win
-                kelly_fraction = max(0.0, (b_odds * p_win - q_loss) / b_odds) * 100.0
-                safe_kelly = kelly_fraction * 0.5
-
-                aligned_returns = pd.concat([clean_df['Return'], bench_returns], axis=1).dropna()
-                if len(aligned_returns) > 30 and aligned_returns.iloc[:, 1].var() > 0:
-                    cov_matrix = np.cov(aligned_returns.iloc[:, 0], aligned_returns.iloc[:, 1])
-                    beta_val = cov_matrix[0, 1] / cov_matrix[1, 1]
-                else:
-                    beta_val = 1.0
-
-                returns_series = clean_df['Return'].dropna()
-                mean_return = returns_series.mean() * 252
-                volatility = returns_series.std() * np.sqrt(252)
-                rf_rate = 0.05
-                sharpe_ratio = (mean_return - rf_rate) / (volatility + 1e-9)
-
-                negative_returns = returns_series[returns_series < 0]
-                downside_std = negative_returns.std() * np.sqrt(252)
-                sortino_ratio = (mean_return - rf_rate) / (downside_std + 1e-9)
-
                 st.divider()
-                st.subheader(f"Frontier Quant Terminal: {ticker}")
+                st.subheader(f"Frontier Quant Terminal: {selected_asset_label} ({r['ticker']})")
 
                 c1, c2 = st.columns(2)
-                c1.metric("Live Market Price", f"{current_price:.4f}")
-                c2.metric("Predicted Next Close", f"{predicted_price:.4f}", f"{price_diff:+.4f} ({pct_change:+.2f}%)")
+                c1.metric("Live Market Price", f"{r['current_price']:.4f}")
+                c2.metric("Predicted Next Close", f"{r['predicted_price']:.4f}", f"{r['price_diff']:+.4f} ({r['pct_change']:+.2f}%)")
 
-                if "BUY" in signal:
-                    st.success(f"Signal: **{signal}**")
-                elif "SELL" in signal:
-                    st.error(f"Signal: **{signal}**")
+                if "BUY" in r['signal']:
+                    st.success(f"Signal: **{r['signal']}**")
+                elif "SELL" in r['signal']:
+                    st.error(f"Signal: **{r['signal']}**")
                 else:
-                    st.warning(f"Signal: **{signal}**")
+                    st.warning(f"Signal: **{r['signal']}**")
 
                 st.markdown("### Execution Strategy & Bayesian Expected Band")
                 t1, t2, t3, t4 = st.columns(4)
-                t1.metric("Take-Profit (2.0x ATR)", f"{target_1:.4f}")
-                t2.metric("Stop-Loss (1.0x ATR)", f"{stop_loss:.4f}")
-                t3.metric("95% Expected Range", f"{lower_band:.2f} - {upper_band:.2f}")
-                t4.metric("Kelly Allocation", f"{safe_kelly:.1f}%")
+                t1.metric("Take-Profit (2.0x ATR)", f"{r['target']:.4f}")
+                t2.metric("Stop-Loss (1.0x ATR)", f"{r['stop_loss']:.4f}")
+                t3.metric("95% Expected Range", f"{r['lower_band']:.2f} - {r['upper_band']:.2f}")
+                t4.metric("Kelly Allocation", f"{r['safe_kelly']:.1f}%")
 
                 st.markdown("### Frontier Spectral & Non-Linear Diagnostics")
                 f1, f2, f3, f4 = st.columns(4)
-                f1.metric("Dominant Cycle (FFT)", f"{fft_dominant_days:.1f} Days")
-                f2.metric("OU Half-Life", f"{ou_half_life_days:.1f} Days" if ou_half_life_days > 0 else "Pure Trend")
-                f3.metric("Fractal Hurst (H)", f"{hurst_val:.2f} ({fractal_state})")
-                f4.metric("Walk-Forward Accuracy", f"{win_rate:.1f}%")
+                f1.metric("Dominant Cycle (FFT)", f"{r['fft_days']:.1f} Days")
+                f2.metric("OU Half-Life", f"{r['ou_days']:.1f} Days" if r['ou_days'] > 0 else "Pure Trend")
+                f3.metric("Fractal Hurst (H)", f"{r['hurst']:.2f} ({r['fractal_state']})")
+                f4.metric("Walk-Forward Accuracy", f"{r['win_rate']:.1f}%")
 
                 st.markdown("### Institutional Macro & Tail Risk Regimes")
                 r1, r2, r3, r4 = st.columns(4)
-                r1.metric("Market Regime (GMM)", regime_label.split()[0])
-                r2.metric(f"Beta ({benchmark_sym})", f"{beta_val:.2f}")
-                r3.metric("Sharpe / Sortino", f"{sharpe_ratio:.2f} / {sortino_ratio:.2f}")
-                r4.metric("Skew / Kurtosis", f"{clean_df['Skew_30'].iloc[-1]:.2f} / {clean_df['Kurt_30'].iloc[-1]:.2f}")
+                r1.metric("Market Regime (GMM)", r['regime'].split()[0])
+                r2.metric(f"Beta ({r['benchmark']})", f"{r['beta']:.2f}")
+                r3.metric("Sharpe / Sortino", f"{r['sharpe']:.2f} / {r['sortino']:.2f}")
+                r4.metric("Skew / Kurtosis", f"{r['skew']:.2f} / {r['kurt']:.2f}")
