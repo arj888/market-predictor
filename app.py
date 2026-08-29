@@ -15,7 +15,64 @@ nltk.download('vader_lexicon', quiet=True)
 st.set_page_config(page_title="Frontier Quantitative Terminal", layout="centered")
 st.title("Frontier Sovereign Quant Engine")
 
-ticker = st.text_input("Enter Ticker (e.g. BTC-USD, RELIANCE.NS, NVDA, EURUSD=X):", "").strip().upper()
+ASSET_PRESETS = {
+    "Crypto": {
+        "Bitcoin (BTC-USD)": "BTC-USD",
+        "Ethereum (ETH-USD)": "ETH-USD",
+        "Solana (SOL-USD)": "SOL-USD",
+        "Binance Coin (BNB-USD)": "BNB-USD",
+        "Ripple (XRP-USD)": "XRP-USD",
+        "Cardano (ADA-USD)": "ADA-USD",
+        "Dogecoin (DOGE-USD)": "DOGE-USD"
+    },
+    "Indian Stocks (NSE)": {
+        "Reliance Industries": "RELIANCE.NS",
+        "TCS": "TCS.NS",
+        "HDFC Bank": "HDFCBANK.NS",
+        "Infosys": "INFY.NS",
+        "ICICI Bank": "ICICIBANK.NS",
+        "State Bank of India": "SBIN.NS",
+        "Tata Motors": "TATAMOTORS.NS",
+        "ITC": "ITC.NS"
+    },
+    "US / Foreign Stocks": {
+        "Nvidia (NVDA)": "NVDA",
+        "Apple (AAPL)": "AAPL",
+        "Microsoft (MSFT)": "MSFT",
+        "Tesla (TSLA)": "TSLA",
+        "Amazon (AMZN)": "AMZN",
+        "Google / Alphabet (GOOGL)": "GOOGL",
+        "Meta Platforms (META)": "META"
+    },
+    "Forex & Commodities": {
+        "EUR / USD": "EURUSD=X",
+        "USD / INR": "USDINR=X",
+        "GBP / USD": "GBPUSD=X",
+        "Gold (GC=F)": "GC=F",
+        "Silver (SI=F)": "SI=F",
+        "Crude Oil (CL=F)": "CL=F"
+    },
+    "Custom Ticker": {}
+}
+
+c_cat, c_asset = st.columns(2)
+
+with c_cat:
+    selected_category = st.selectbox(
+        "Choose Market Category:",
+        list(ASSET_PRESETS.keys())
+    )
+
+with c_asset:
+    if selected_category != "Custom Ticker":
+        asset_options = ASSET_PRESETS[selected_category]
+        selected_asset_label = st.selectbox(
+            f"Select {selected_category} Asset:",
+            list(asset_options.keys())
+        )
+        ticker = asset_options[selected_asset_label]
+    else:
+        ticker = st.text_input("Enter Any Custom Ticker (e.g. BTC-USD, RELIANCE.NS, TSLA):", "").strip().upper()
 
 def compute_hurst_exponent(ts, max_lag=20):
     try:
@@ -93,9 +150,9 @@ def get_benchmark_ticker(symbol):
 
 if st.button("Execute Frontier Synthesis"):
     if not ticker:
-        st.error("Please provide a valid market asset identifier.")
+        st.error("Please select or enter a valid market asset identifier.")
     else:
-        with st.spinner("Synthesizing Spectral Waves, Stochastic Differential Equations & Deep Ensembles..."):
+        with st.spinner(f"Synthesizing Spectral Waves, Stochastic Differential Equations & Deep Ensembles for {ticker}..."):
             asset = yf.Ticker(ticker)
             df = asset.history(period="3y", interval="1d", auto_adjust=False)
 
